@@ -1,0 +1,6 @@
+data/
+*.db
+.salt
+__pycache__/
+*.pyc
+.env
