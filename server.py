@@ -74,6 +74,26 @@ def get_db():
             updated_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            credential_name TEXT NOT NULL,
+            agent TEXT NOT NULL DEFAULT 'unknown',
+            action TEXT NOT NULL,
+            ip_address TEXT DEFAULT '',
+            timestamp TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            credential_name TEXT NOT NULL,
+            allowed_agent TEXT NOT NULL DEFAULT '*',
+            max_uses INTEGER DEFAULT -1,
+            use_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -154,7 +174,36 @@ def reveal_secret(sid: str):
         plain = decrypt(row["value"], KEY)
     except Exception:
         raise HTTPException(500, "解密失败，MASTER_PASSWORD 可能已更改")
+    # Audit this access
+    _log_audit_entry(row["name"], "legacy-api", "revealed")
     return {"name": row["name"], "value": plain}
+
+def _do_reveal(sid: str, agent: str = "web-ui") -> dict:
+    """Shared reveal logic with audit logging."""
+    db = get_db()
+    row = db.execute("SELECT name, value FROM secrets WHERE id=?", (sid,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "not found")
+    try:
+        plain = decrypt(row["value"], KEY)
+    except Exception:
+        raise HTTPException(500, "解密失败，MASTER_PASSWORD 可能已更改")
+    _log_audit_entry(row["name"], agent, "revealed")
+    return {"name": row["name"], "value": plain}
+
+def _log_audit_entry(credential_name: str, agent: str, action: str):
+    """Write an audit log entry."""
+    try:
+        db = get_db()
+        db.execute(
+            "INSERT INTO audit_log (credential_name, agent, action, timestamp) VALUES (?, ?, ?, ?)",
+            (credential_name, agent, action, now())
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
 
 # ── export: one-liner for .bashrc (bypasses redaction) ──────────────
 @app.get("/api/export/bashrc", response_class=PlainTextResponse)
@@ -188,7 +237,68 @@ def export_env():
             pass
     return "\n".join(lines)
 
-# ── HTML frontend ───────────────────────────────────────────────────
+# ── audit log ─────────────────────────────────────────────────────────
+@app.post("/api/audit")
+def log_audit(data: dict):
+    """Log a credential access event."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO audit_log (credential_name, agent, action, timestamp) VALUES (?, ?, ?, ?)",
+        (data.get("credential_name", ""), data.get("agent", "unknown"),
+         data.get("action", "accessed"), now())
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.get("/api/audit")
+def list_audit(limit: int = 50):
+    """List recent audit log entries."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+# ── access control ────────────────────────────────────────────────────
+@app.get("/api/access-rules")
+def list_rules():
+    db = get_db()
+    rows = db.execute("SELECT * FROM access_rules ORDER BY credential_name").fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+@app.post("/api/access-rules")
+def create_rule(data: dict):
+    db = get_db()
+    db.execute(
+        "INSERT INTO access_rules (credential_name, allowed_agent, max_uses, created_at) VALUES (?, ?, ?, ?)",
+        (data.get("credential_name", ""), data.get("allowed_agent", "*"),
+         data.get("max_uses", -1), now())
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.delete("/api/access-rules/{rule_id}")
+def delete_rule(rule_id: int):
+    db = get_db()
+    db.execute("DELETE FROM access_rules WHERE id=?", (rule_id,))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.get("/api/reveal/{sid}")
+def reveal_secret(sid: str, agent: str = "web-ui"):
+    """Reveal a secret with audit logging."""
+    return _do_reveal(sid, agent)
+
+@app.get("/api/secrets/{sid}/reveal")
+def reveal_secret_legacy(sid: str):
+    """Legacy reveal endpoint (backward compatible)."""
+    return _do_reveal(sid, "legacy-api")
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
