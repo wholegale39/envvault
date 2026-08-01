@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -33,6 +33,9 @@ SALT_PATH = DATA_DIR / ".salt"
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
 if not MASTER_PASSWORD:
     raise SystemExit("需要设置 MASTER_PASSWORD 环境变量")
+
+# 可选 API token：设置后所有 /api/* 需要 Authorization: Bearer <token>
+API_TOKEN = os.environ.get("ENVVAULT_API_TOKEN", "")
 
 # ── encryption helpers ──────────────────────────────────────────────
 def _get_salt():
@@ -119,29 +122,69 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="EnvVault", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+
+def require_auth(authorization: str = Header(default="")):
+    """若配置了 ENVVAULT_API_TOKEN，则要求 Bearer token。"""
+    if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
 # ── API ─────────────────────────────────────────────────────────────
-@app.get("/api/secrets")
+@app.get("/api/secrets", dependencies=[Depends(require_auth)])
 def list_secrets():
     db = get_db()
     rows = db.execute("SELECT id, name, group_name, created_at, updated_at FROM secrets ORDER BY group_name, name").fetchall()
     db.close()
     return [dict(r) for r in rows]
 
-@app.post("/api/secrets")
-def create_secret(s: SecretIn):
+def create_secret_inner(s: SecretIn):
+    """创建密钥；同组同名已存在时更新（upsert）。"""
     db = get_db()
+    ts = now()
+    existing = db.execute(
+        "SELECT id FROM secrets WHERE name=? AND group_name=?",
+        (s.name.strip(), s.group_name.strip())).fetchone()
+    if existing:
+        encrypted = encrypt(s.value, KEY)
+        db.execute("UPDATE secrets SET value=?, updated_at=? WHERE id=?",
+                   (encrypted, ts, existing["id"]))
+        db.commit()
+        db.close()
+        return {"id": existing["id"], "name": s.name.strip(),
+                "group_name": s.group_name.strip(), "updated": True}
     sid = uuid.uuid4().hex[:12]
     encrypted = encrypt(s.value, KEY)
-    ts = now()
     db.execute(
         "INSERT INTO secrets (id, name, value, group_name, created_at, updated_at) VALUES (?,?,?,?,?,?)",
         (sid, s.name.strip(), encrypted, s.group_name.strip(), ts, ts),
     )
     db.commit()
     db.close()
-    return {"id": sid, "name": s.name.strip(), "group_name": s.group_name.strip()}
+    return {"id": sid, "name": s.name.strip(),
+            "group_name": s.group_name.strip(), "updated": False}
 
-@app.put("/api/secrets/{sid}")
+
+@app.post("/api/secrets", dependencies=[Depends(require_auth)])
+def create_secret(s: SecretIn):
+    return create_secret_inner(s)
+
+
+class BulkSecretsIn(BaseModel):
+    secrets: list[SecretIn]
+
+
+@app.post("/api/secrets/bulk", dependencies=[Depends(require_auth)])
+def create_secrets_bulk(body: BulkSecretsIn):
+    """批量导入：同名同组自动 upsert。"""
+    created = updated = 0
+    for s in body.secrets:
+        r = create_secret_inner(s)
+        if r.get("updated"):
+            updated += 1
+        else:
+            created += 1
+    return {"ok": True, "created": created, "updated": updated}
+
+@app.put("/api/secrets/{sid}", dependencies=[Depends(require_auth)])
 def update_secret(sid: str, s: SecretUpdate):
     db = get_db()
     row = db.execute("SELECT id FROM secrets WHERE id=?", (sid,)).fetchone()
@@ -155,7 +198,7 @@ def update_secret(sid: str, s: SecretUpdate):
     db.close()
     return {"ok": True}
 
-@app.delete("/api/secrets/{sid}")
+@app.delete("/api/secrets/{sid}", dependencies=[Depends(require_auth)])
 def delete_secret(sid: str):
     db = get_db()
     db.execute("DELETE FROM secrets WHERE id=?", (sid,))
@@ -163,7 +206,7 @@ def delete_secret(sid: str):
     db.close()
     return {"ok": True}
 
-@app.get("/api/secrets/{sid}/reveal")
+@app.get("/api/secrets/{sid}/reveal", dependencies=[Depends(require_auth)])
 def reveal_secret(sid: str):
     db = get_db()
     row = db.execute("SELECT name, value FROM secrets WHERE id=?", (sid,)).fetchone()
@@ -206,7 +249,7 @@ def _log_audit_entry(credential_name: str, agent: str, action: str):
         pass
 
 # ── export: one-liner for .bashrc (bypasses redaction) ──────────────
-@app.get("/api/export/bashrc", response_class=PlainTextResponse)
+@app.get("/api/export/bashrc", dependencies=[Depends(require_auth)], response_class=PlainTextResponse)
 def export_bashrc():
     db = get_db()
     rows = db.execute("SELECT name, value FROM secrets").fetchall()
@@ -221,9 +264,9 @@ def export_bashrc():
             lines.append(f'export {name}="$(echo {b64} | base64 -d)"')
         except Exception:
             pass
-    return "\n".join(lines)
+    return "# EnvVault export — base64 编码（防误读，非加密）。敏感环境请用 /api/export/encrypted\n" + "\n".join(lines)
 
-@app.get("/api/export/env", response_class=PlainTextResponse)
+@app.get("/api/export/env", dependencies=[Depends(require_auth)], response_class=PlainTextResponse)
 def export_env():
     db = get_db()
     rows = db.execute("SELECT name, value FROM secrets").fetchall()
@@ -235,10 +278,29 @@ def export_env():
             lines.append(f'{r["name"].strip().replace(" ", "_").upper()}="{plain}"')
         except Exception:
             pass
-    return "\n".join(lines)
+    return "# EnvVault export — 明文导出，仅限可信环境。敏感环境请用 /api/export/encrypted\n" + "\n".join(lines)
+
+
+@app.get("/api/export/encrypted", dependencies=[Depends(require_auth)])
+def export_encrypted():
+    """加密导出：全部密钥用当前主密钥 AES-GCM 加密为一个包（适合备份/迁移）。"""
+    db = get_db()
+    rows = db.execute("SELECT name, value FROM secrets").fetchall()
+    db.close()
+    payload = {}
+    for r in rows:
+        try:
+            payload[r["name"]] = decrypt(r["value"], KEY)
+        except Exception:
+            pass
+    return {
+        "format": "envvault-encrypted-v1",
+        "ciphertext": encrypt(json.dumps(payload), KEY),
+        "note": "用 EnvVault 主密钥（MASTER_PASSWORD 派生）AES-256-GCM 加密",
+    }
 
 # ── audit log ─────────────────────────────────────────────────────────
-@app.post("/api/audit")
+@app.post("/api/audit", dependencies=[Depends(require_auth)])
 def log_audit(data: dict):
     """Log a credential access event."""
     db = get_db()
@@ -251,7 +313,47 @@ def log_audit(data: dict):
     db.close()
     return {"ok": True}
 
-@app.get("/api/audit")
+@app.get("/api/health")
+def health():
+    """健康检查（免鉴权，供自启脚本/监控使用）。"""
+    db = get_db()
+    n = db.execute("SELECT COUNT(*) AS c FROM secrets").fetchone()["c"]
+    db.close()
+    return {"status": "ok", "version": "0.2.0", "secrets_count": n, "time": now()}
+
+
+class RekeyIn(BaseModel):
+    new_password: str
+
+
+@app.post("/api/rekey", dependencies=[Depends(require_auth)])
+def rekey(body: RekeyIn):
+    """主密码轮换：用新密码重新派生密钥并重加密全部密钥。"""
+    global KEY, SALT
+    if len(body.new_password) < 8:
+        raise HTTPException(400, "新密码至少 8 位")
+    db = get_db()
+    rows = db.execute("SELECT id, value FROM secrets").fetchall()
+    new_salt = os.urandom(32)
+    new_key = scrypt(body.new_password.encode(), new_salt, key_len=32, N=2**14, r=8, p=1)
+    count = 0
+    for r in rows:
+        try:
+            plain = decrypt(r["value"], KEY)
+            db.execute("UPDATE secrets SET value=? WHERE id=?",
+                       (encrypt(plain, new_key), r["id"]))
+            count += 1
+        except Exception:
+            pass
+    SALT_PATH.write_bytes(new_salt)
+    db.commit()
+    db.close()
+    SALT = new_salt
+    KEY = new_key
+    return {"ok": True, "reencrypted": count}
+
+
+@app.get("/api/audit", dependencies=[Depends(require_auth)])
 def list_audit(limit: int = 50):
     """List recent audit log entries."""
     db = get_db()
@@ -263,14 +365,14 @@ def list_audit(limit: int = 50):
 
 
 # ── access control ────────────────────────────────────────────────────
-@app.get("/api/access-rules")
+@app.get("/api/access-rules", dependencies=[Depends(require_auth)])
 def list_rules():
     db = get_db()
     rows = db.execute("SELECT * FROM access_rules ORDER BY credential_name").fetchall()
     db.close()
     return [dict(r) for r in rows]
 
-@app.post("/api/access-rules")
+@app.post("/api/access-rules", dependencies=[Depends(require_auth)])
 def create_rule(data: dict):
     db = get_db()
     db.execute(
@@ -282,7 +384,7 @@ def create_rule(data: dict):
     db.close()
     return {"ok": True}
 
-@app.delete("/api/access-rules/{rule_id}")
+@app.delete("/api/access-rules/{rule_id}", dependencies=[Depends(require_auth)])
 def delete_rule(rule_id: int):
     db = get_db()
     db.execute("DELETE FROM access_rules WHERE id=?", (rule_id,))
@@ -290,12 +392,12 @@ def delete_rule(rule_id: int):
     db.close()
     return {"ok": True}
 
-@app.get("/api/reveal/{sid}")
+@app.get("/api/reveal/{sid}", dependencies=[Depends(require_auth)])
 def reveal_secret(sid: str, agent: str = "web-ui"):
     """Reveal a secret with audit logging."""
     return _do_reveal(sid, agent)
 
-@app.get("/api/secrets/{sid}/reveal")
+@app.get("/api/secrets/{sid}/reveal", dependencies=[Depends(require_auth)])
 def reveal_secret_legacy(sid: str):
     """Legacy reveal endpoint (backward compatible)."""
     return _do_reveal(sid, "legacy-api")
@@ -348,6 +450,7 @@ th { background: #fafafa; font-weight: 600; color: #555; }
 <div class="tabs">
   <div class="tab active" data-tab="secrets">密钥列表</div>
   <div class="tab" data-tab="export">导出</div>
+  <div class="tab" data-tab="audit">审计日志</div>
 </div>
 
 <div id="tab-secrets">
@@ -363,6 +466,12 @@ th { background: #fafafa; font-weight: 600; color: #555; }
     <button class="btn-ghost" onclick="exportFmt('env')">导出 .env</button>
   </div>
   <div class="export-box" id="export-box"></div>
+</div>
+<div id="tab-audit" style="display:none">
+  <div class="actions">
+    <button class="btn btn-primary" onclick="loadAudit()">刷新</button>
+  </div>
+  <div id="audit-list"></div>
 </div>
 
 <!-- modal -->
@@ -489,6 +598,17 @@ async function exportFmt(fmt) {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+async function loadAudit() {
+  const box = document.getElementById('audit-list');
+  const entries = await api('GET', '/api/audit?limit=100');
+  if (!entries.length) { box.innerHTML = '<div style="text-align:center;padding:40px;color:#999">暂无审计记录</div>'; return; }
+  let html = '<table><tr><th>时间</th><th>密钥</th><th>操作</th><th>Agent</th></tr>';
+  for (const e of entries) {
+    html += `<tr><td>${esc(e.timestamp || '')}</td><td><strong>${esc(e.credential_name)}</strong></td><td>${esc(e.action)}</td><td>${esc(e.agent)}</td></tr>`;
+  }
+  box.innerHTML = html + '</table>';
+}
+
 // tabs
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -497,6 +617,8 @@ document.querySelectorAll('.tab').forEach(tab => {
     const target = tab.dataset.tab;
     document.getElementById('tab-secrets').style.display = target === 'secrets' ? 'block' : 'none';
     document.getElementById('tab-export').style.display = target === 'export' ? 'block' : 'none';
+    document.getElementById('tab-audit').style.display = target === 'audit' ? 'block' : 'none';
+    if (target === 'audit') loadAudit();
   });
 });
 

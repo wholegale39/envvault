@@ -51,6 +51,9 @@ MCP_TOOLS = [
 ]
 
 
+VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "")
+
+
 class MCPVaultServer:
     """MCP server that proxies to the EnvVault HTTP API."""
 
@@ -101,7 +104,8 @@ class MCPVaultServer:
 
     def _handle_get_credential(self, req_id: Any, args: dict) -> dict:
         name = args.get("name", "")
-        agent = args.get("agent", "unknown")
+        agent = (args.get("agent") or os.environ.get("OPENCLAW_AGENT_ID")
+                 or os.environ.get("USER") or "unknown")
 
         if not name:
             return self._make_error(req_id, -32602, "Missing required parameter: name")
@@ -132,7 +136,7 @@ class MCPVaultServer:
             # Log audit via vault API directly (add to audit table)
             self._log_audit(name, agent, "granted")
 
-            return self._make_response(req_id, {
+            return self._make_tool_response(req_id, {
                 "name": data["name"],
                 "value": data["value"],
             })
@@ -150,7 +154,7 @@ class MCPVaultServer:
             secrets = resp.json()
             names_only = [{"name": s["name"], "group": s.get("group_name", ""),
                           "created_at": s.get("created_at", "")} for s in secrets]
-            return self._make_response(req_id, {"credentials": names_only})
+            return self._make_tool_response(req_id, {"credentials": names_only})
         except Exception as e:
             return self._make_error(req_id, -32000, f"Vault connection failed: {e}")
 
@@ -168,6 +172,19 @@ class MCPVaultServer:
 
     def _make_response(self, req_id: Any, result: dict) -> dict:
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    def _make_tool_response(self, req_id: Any, data: dict) -> dict:
+        """标准 MCP tools/call 响应：内容包装在 result.content[] 中"""
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(data, ensure_ascii=False)}
+                ],
+                "isError": False,
+            },
+        }
 
     def _make_error(self, req_id: Any, code: int, message: str) -> dict:
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
