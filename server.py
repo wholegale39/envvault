@@ -333,24 +333,29 @@ def rekey(body: RekeyIn):
     if len(body.new_password) < 8:
         raise HTTPException(400, "新密码至少 8 位")
     db = get_db()
-    rows = db.execute("SELECT id, value FROM secrets").fetchall()
+    rows = db.execute("SELECT id, name, value FROM secrets").fetchall()
     new_salt = os.urandom(32)
     new_key = scrypt(body.new_password.encode(), new_salt, key_len=32, N=2**14, r=8, p=1)
     count = 0
+    failed = []
     for r in rows:
         try:
             plain = decrypt(r["value"], KEY)
             db.execute("UPDATE secrets SET value=? WHERE id=?",
                        (encrypt(plain, new_key), r["id"]))
             count += 1
-        except Exception:
-            pass
+        except Exception as e:
+            failed.append({"id": r["id"], "name": r["name"], "error": str(e)})
     SALT_PATH.write_bytes(new_salt)
     db.commit()
     db.close()
     SALT = new_salt
     KEY = new_key
-    return {"ok": True, "reencrypted": count}
+    result = {"ok": True, "reencrypted": count, "failed": failed}
+    if failed:
+        result["ok"] = False
+        result["message"] = f"{len(failed)} 个密钥解密失败，未重加密（旧密钥已失效，请从备份恢复）"
+    return result
 
 
 @app.get("/api/audit", dependencies=[Depends(require_auth)])
