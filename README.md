@@ -1,7 +1,7 @@
 # EnvVault · Agent 凭证保险箱
 
 AES-256-GCM 加密的密钥管理服务。与 OpenAI MCP 协议兼容，Agent 可以安全地请求和取用凭证——全程审计、Agent 不碰明文密钥。
-
+![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![GitHub stars](https://img.shields.io/github/stars/wholegale39/envvault)
 ## 为什么做这个？
 
 Agent 需要调用各种 API（GitHub、Gmail、Notion、DeepSeek…），密钥放哪？环境变量？不安全。硬编码？更不安全。
